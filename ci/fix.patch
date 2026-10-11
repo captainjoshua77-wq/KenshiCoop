@@ -1,0 +1,194 @@
+From 0f187774349dd523e954f974393d5cfe4f6c110b Mon Sep 17 00:00:00 2001
+From: KenshiCoop player report <noreply@anthropic.com>
+Date: Sat, 10 Oct 2026 17:40:21 -0700
+Subject: [PATCH] coop: re-keyed bodies stop flickering, and a placed door
+ opens on both screens
+
+Two identity-translation gaps found in a two-PC field session (v0.51,
+KENSHICOOP_CELL_AUTH=0 on both clients, both players in one town).
+
+RE-KEYED BODIES WERE CULLED BY THE WIDE CENSUS PASS. When a fight starts the
+engine separateIntoMyOwnSquad's a town NPC into a fresh local container, so
+the join's copy gets a new local hand. The drive already logs the translation
+([rekey] wire=... local=...), but enforceHostAuthority's wide pass looked the
+LOCAL hand up in a census keyed by the host's hand, missed, and culled the
+body; the next drive sample restored it (proxy/driven exemption) and the cycle
+repeated. In 17 minutes the join logged 1303 wide culls and 1273 restores -
+1275 of the culls (98%) on 9 re-keyed bodies, one 'Shek Retainer' 702 times.
+Players see the same townspeople blink in and out.
+
+The drive now records the reverse map (wireOfLocal_, local -> wire) whenever a
+driven body's local hand diverges from its wire key. It is not pruned with
+drivenSeen_/canonicalOf_ (30 s), because the wide pass needs it exactly after
+the stream has moved on; hands are serial-checked so a stale entry can only
+match the body it was stamped for, and it is cleared in resetSession. The wide
+pass treats a body as existing when its translated wire key is in the census
+or in this tick's streamed set.
+
+A PLACED BUILDING THAT IS ITSELF A DOOR NEVER SYNCED ITS STATE. Forgotten
+Buildings makes 'Storm House Door E' (4029-TwoStorey.mod) placeable on its
+own. It has no parent building, so the protocol-28 partition never claims it
+and publishDoors streams it on protocol 26 under the placer's runtime hand -
+which names nothing on the peer, whose copy is the proxy minted from the
+PLACE (mint OK, dy=0.0). applyDoors' readDoorByHand failed and the row was
+dropped as "runtime door - accepted edge": the placer logged
+'[door] SEND ... open=1' and the join logged no [door] line at all, so the
+door stayed shut on one screen.
+
+publishDoors now sends a minted proxy door under the placer's wire key
+(mintByLocal_), and applyDoors resolves an inbound placer key through
+peerBuilds_ to the local proxy (also seeding that local row's baseline as the
+echo guard). Doors that come from the save, and doors that are children of
+placed buildings (protocol 28), are unaffected. No wire change; no log string
+changed.
+
+Not built or run against the harness: checked with clang -fsyntax-only
+(C++03, stubbed windows.h, real enet headers) on the four touched TUs only.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01Nx3WGAiNWtET5BLWsyajcy
+---
+ src/plugin/sync/Replicator.h            | 13 +++++++++
+ src/plugin/sync/ReplicatorAuthority.cpp | 12 ++++++++
+ src/plugin/sync/ReplicatorChannels.cpp  | 37 +++++++++++++++++++++++--
+ src/plugin/sync/ReplicatorCore.cpp      |  1 +
+ src/plugin/sync/ReplicatorDrive.cpp     |  4 +++
+ 5 files changed, 64 insertions(+), 3 deletions(-)
+
+diff --git a/src/plugin/sync/Replicator.h b/src/plugin/sync/Replicator.h
+index 55bc114..8c82157 100644
+--- a/src/plugin/sync/Replicator.h
++++ b/src/plugin/sync/Replicator.h
+@@ -1071,6 +1071,19 @@ private:
+     // Last LOCAL hand reported for each wire key, so the [rekey] translation
+     // line is emitted on change rather than every drive tick.
+     std::map<Key, Key>        rekeyLogged_;
++    // Reverse of the [rekey] translation: LOCAL hand -> the wire key the peer
++    // streams (and lists in its census) for the same body. Stamped whenever the
++    // drive sees a driven body's local hand diverge from its wire key, and NOT
++    // pruned with drivenSeen_/canonicalOf_: a re-keyed body keeps its new local
++    // hand after the stream moves on, which is exactly when the wide census
++    // pass needs the translation. Without it that pass looks the LOCAL hand up
++    // in a census keyed by the peer's hand, misses, culls the body, the next
++    // drive sample restores it (proxy/driven exemption), and the cycle repeats.
++    // Field session 2026-10-10 (cellAuth=0, two players in one town): 1275 of
++    // the join's 1303 wide culls in 17 min hit 9 re-keyed bodies, one 'Shek
++    // Retainer' 702 times. Hands are serial-checked, so a stale entry can only
++    // ever match the body it was stamped for. Cleared with the session.
++    std::map<Key, Key>        wireOfLocal_;
+     // Step-5 hysteresis: consecutive-frame counters per hand so a brief stream
+     // hiccup doesn't suppress (needs ~1 s unstreamed) and a boundary NPC doesn't
+     // flicker back (needs ~2 s streamed dwell to restore). Spike 18: the hard
+diff --git a/src/plugin/sync/ReplicatorAuthority.cpp b/src/plugin/sync/ReplicatorAuthority.cpp
+index fe82227..bc3aca7 100644
+--- a/src/plugin/sync/ReplicatorAuthority.cpp
++++ b/src/plugin/sync/ReplicatorAuthority.cpp
+@@ -508,6 +508,18 @@ void Replicator::enforceHostAuthority(GameWorld* gw, u32 localId) {
+             if (driven && suppressed_.find(k) == suppressed_.end()) continue;
+             bool exists = censusHands_.find(k) != censusHands_.end() ||
+                           keep.find(k) != keep.end() || driven;
++            if (!exists) {
++                // A RE-KEYED body (a fight start separateIntoMyOwnSquad's our
++                // copy into a fresh local container) is listed in the census
++                // under the peer's wire key, never under the local hand we just
++                // looked up. Absence of the local hand is then not absence of
++                // the body - consult the translation the drive recorded.
++                std::map<Key, Key>::const_iterator wk = wireOfLocal_.find(k);
++                if (wk != wireOfLocal_.end() &&
++                    (censusHands_.find(wk->second) != censusHands_.end() ||
++                     keep.find(wk->second) != keep.end()))
++                    exists = true;
++            }
+             std::map<Key, Character*>::iterator s = suppressed_.find(k);
+             AuthCount& ac = authCount_[k];
+             // Dormancy, same as the near pass - and this is where it matters
+diff --git a/src/plugin/sync/ReplicatorChannels.cpp b/src/plugin/sync/ReplicatorChannels.cpp
+index 98c3c8c..985de11 100644
+--- a/src/plugin/sync/ReplicatorChannels.cpp
++++ b/src/plugin/sync/ReplicatorChannels.cpp
+@@ -833,7 +833,20 @@ void Replicator::publishDoors(const SyncContext& ctx) {
+         pkt.type    = (u8)PKT_DOOR;
+         pkt.ownerId = ownerId;
+         pkt.seq     = doorSeqOut_++;
+-        for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
++        // A building that IS a door (a standalone placed door or gate, e.g.
++        // Forgotten Buildings' 'Storm House Door E') has no parent, so the
++        // protocol-28 partition above never claims it and it streams here. If
++        // this copy is a proxy WE minted from the peer's PLACE, our runtime
++        // hand names nothing on the placer: express it in the placer's key
++        // space, which on the placer is simply its own hand.
++        std::map<Key, Key>::const_iterator mk = mintByLocal_.find(k);
++        if (mk != mintByLocal_.end()) {
++            pkt.hand[0] = mk->second.t;  pkt.hand[1] = mk->second.c;
++            pkt.hand[2] = mk->second.cs; pkt.hand[3] = mk->second.i;
++            pkt.hand[4] = mk->second.s;
++        } else {
++            for (unsigned int h = 0; h < 5; ++h) pkt.hand[h] = r.hand[h];
++        }
+         pkt.open    = (u8)(r.open ? 1 : 0);
+         pkt.locked  = (u8)(r.locked ? 1 : 0);
+         net.queueDoor(pkt);
+@@ -865,13 +878,31 @@ void Replicator::applyDoors(const SyncContext& ctx) {
+         // write causes must not be re-detected as ours next sample.
+         dr.knownOpen = (int)p.open; dr.knownLocked = (int)p.locked;
+         dr.seeded = true;
++        // The mirror of publishDoors' translation: a placed building that IS a
++        // door arrives under the PLACER's hand, which on this client names
++        // nothing - our copy is the proxy minted from the PLACE under another
++        // runtime hand. Resolve it through the build map (field session
++        // 2026-10-10: the placer's '[door] SEND open=1' for a placed door had
++        // no RECV at all on the join, and the door stayed shut there).
++        const unsigned int* useHand = p.hand;
++        std::map<Key, PeerBuild>::const_iterator pbit = peerBuilds_.find(k);
++        if (pbit != peerBuilds_.end() && pbit->second.minted &&
++            !pbit->second.removed) {
++            useHand = pbit->second.localHand;
++            // Same echo guard, keyed the way OUR sampler sees this door.
++            Key lk; lk.t = useHand[0]; lk.c = useHand[1]; lk.cs = useHand[2];
++            lk.i = useHand[3]; lk.s = useHand[4];
++            DoorRow& lr = doorRows_[lk];
++            lr.knownOpen = (int)p.open; lr.knownLocked = (int)p.locked;
++            lr.seeded = true;
++        }
+         engine::DoorRead cur;
+-        if (!engine::readDoorByHand(p.hand, &cur))
++        if (!engine::readDoorByHand(useHand, &cur))
+             continue; // out-of-interest or runtime door - accepted edge
+         bool lockMoves = cur.hasLock && (cur.locked != (int)p.locked);
+         if (cur.open == (int)p.open && !lockMoves)
+             continue; // already converged (resend or echo)
+-        bool ok = engine::writeDoorByHand(p.hand, (int)p.open,
++        bool ok = engine::writeDoorByHand(useHand, (int)p.open,
+                                           cur.hasLock ? (int)p.locked : -1, 0);
+         char b[176];
+         _snprintf(b, sizeof(b) - 1,
+diff --git a/src/plugin/sync/ReplicatorCore.cpp b/src/plugin/sync/ReplicatorCore.cpp
+index dc11c56..901b8dc 100644
+--- a/src/plugin/sync/ReplicatorCore.cpp
++++ b/src/plugin/sync/ReplicatorCore.cpp
+@@ -186,6 +186,7 @@ void Replicator::resetSession() {
+     drivenSeen_.clear();       // recently-driven grace (pointers dangle after swap)
+     canonicalOf_.clear();      // capture-translation reverse map (same pointers)
+     rekeyLogged_.clear();      // and the change-detector for its [rekey] line
++    wireOfLocal_.clear();      // local->wire rekey translation (old world's hands)
+     jailObs_.clear();          // jail-observe spike per-captive last sample
+     proxyByKey_.clear();
+     suppressed_.clear();
+diff --git a/src/plugin/sync/ReplicatorDrive.cpp b/src/plugin/sync/ReplicatorDrive.cpp
+index 59f1196..7867437 100644
+--- a/src/plugin/sync/ReplicatorDrive.cpp
++++ b/src/plugin/sync/ReplicatorDrive.cpp
+@@ -294,6 +294,10 @@ void Replicator::applyTargets(GameWorld* gw) {
+                  lh[2] != it->first.cs)) {
+                 Key lk; lk.t = lh[0]; lk.c = lh[1]; lk.cs = lh[2];
+                 lk.i = lh[3]; lk.s = lh[4];
++                // Keep the reverse translation for the wide census pass, which
++                // judges this body by its LOCAL hand long after the stream (and
++                // canonicalOf_'s 30 s horizon) has moved on.
++                wireOfLocal_[lk] = it->first;
+                 std::map<Key, Key>::iterator rk = rekeyLogged_.find(it->first);
+                 if (rk == rekeyLogged_.end() ||
+                     (rk->second < lk) || (lk < rk->second)) {
+-- 
+2.43.0
+
